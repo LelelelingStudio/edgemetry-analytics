@@ -1,0 +1,14 @@
+node_modules/
+dist/
+.wrangler/
+.dev.vars
+.env
+*.log
+.DS_Store
+.claude/
+# Written by `npm run seed -- --days N`
+.seed.sql
+# Written by `npm run build:demo`. Generated from src/dashboard.html on every
+# push and published by .github/workflows/demo.yml, so it is never committed —
+# a checked-in copy is exactly the thing that goes stale.
+demo-dist/

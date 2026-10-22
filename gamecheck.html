@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>游戏实时数据看板</title>
+    <style>
+        :root {
+            --bg: #f8fafc;
+            --card-bg: #ffffff;
+            --text-main: #1e293b;
+            --text-muted: #64748b;
+            --primary: #3b82f6;
+            --primary-light: #eff6ff;
+            --border: #e2e8f0;
+            --top1: #ef4444;
+            --top2: #f97316;
+            --top3: #eab308;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            background-color: var(--bg);
+            color: var(--text-main);
+            margin: 0;
+            padding: 20px;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
+            gap: 15px;
+        }
+        h1 { margin: 0; font-size: 24px; }
+        
+        .controls {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+        select, button {
+            padding: 8px 16px;
+            border-radius: 8px;
+            border: 1px solid var(--border);
+            background: var(--card-bg);
+            color: var(--text-main);
+            font-size: 14px;
+            cursor: pointer;
+            outline: none;
+            transition: all 0.2s;
+        }
+        select:hover, button:hover { border-color: var(--primary); }
+        button.active {
+            background: var(--primary);
+            color: white;
+            border-color: var(--primary);
+        }
+
+        .grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+            margin-bottom: 20px;
+        }
+        @media (max-width: 768px) {
+            .grid { grid-template-columns: 1fr; }
+        }
+
+        .card {
+            background: var(--card-bg);
+            border-radius: 12px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+            border: 1px solid var(--border);
+            padding: 20px;
+            overflow: hidden;
+        }
+        .card h2 {
+            margin-top: 0;
+            font-size: 18px;
+            padding-bottom: 15px;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .list-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 12px 0;
+            border-bottom: 1px dashed var(--border);
+        }
+        .list-item:last-child { border-bottom: none; }
+        
+        .game-name {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            font-weight: 500;
+        }
+        .rank {
+            display: inline-block;
+            width: 24px;
+            height: 24px;
+            line-height: 24px;
+            text-align: center;
+            border-radius: 50%;
+            font-size: 12px;
+            font-weight: bold;
+            background: var(--bg);
+            color: var(--text-muted);
+        }
+        .rank-1 { background: var(--top1); color: white; }
+        .rank-2 { background: var(--top2); color: white; }
+        .rank-3 { background: var(--top3); color: white; }
+        
+        .game-value { font-weight: bold; color: var(--primary); }
+
+        .table-container {
+            display: none;
+            background: var(--card-bg);
+            border-radius: 12px;
+            border: 1px solid var(--border);
+            overflow-x: auto;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            text-align: left;
+        }
+        th, td {
+            padding: 12px 20px;
+            border-bottom: 1px solid var(--border);
+        }
+        th {
+            background: #f8fafc;
+            font-weight: 600;
+            color: var(--text-muted);
+        }
+        tr:hover { background: var(--primary-light); }
+
+        .loading { text-align: center; padding: 50px; color: var(--text-muted); }
+        .error { text-align: center; padding: 20px; color: red; display: none; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <div class="header">
+        <h1>🎮 游戏数据看板</h1>
+        <div class="controls">
+            <select id="timeRange" onchange="fetchData()">
+                <option value="today">今天</option>
+                <option value="7d">近 7 天</option>
+                <option value="30d" selected>近 30 天</option>
+                <option value="90d">近 90 天</option>
+                <option value="12mo">近 12 个月</option>
+            </select>
+            
+            <select id="topLimit" onchange="fetchData()">
+                <option value="5">Top 5</option>
+                <option value="10" selected>Top 10</option>
+                <option value="20">Top 20</option>
+                <option value="all">查看全部</option>
+            </select>
+        </div>
+    </div>
+
+    <div id="loading" class="loading">数据加载中...</div>
+    <div id="error" class="error">加载失败，请检查接口或网络</div>
+
+    <div class="grid" id="rankContainer" style="display: none;">
+        <div class="card">
+            <h2>🔥 热门排行</h2>
+            <div id="topList"></div>
+        </div>
+        <div class="card">
+            <h2>🧊 冷门排行</h2>
+            <div id="bottomList"></div>
+        </div>
+    </div>
+
+    <div class="table-container" id="tableContainer" style="display: none;">
+        <table>
+            <thead>
+                <tr>
+                    <th>排名</th>
+                    <th>游戏名称</th>
+                    <th>访问次数</th>
+                    <th>占比</th>
+                </tr>
+            </thead>
+            <tbody id="tableBody"></tbody>
+        </table>
+    </div>
+</div>
+
+<script>
+    const BASE_API = '/api/breakdown?site=1&cmp=1&limit=1000&dim=path,referrer,event,country,device';
+
+    async function fetchData() {
+        const range = document.getElementById('timeRange').value;
+        const limitType = document.getElementById('topLimit').value;
+        
+        document.getElementById('loading').style.display = 'block';
+        document.getElementById('error').style.display = 'none';
+        document.getElementById('rankContainer').style.display = 'none';
+        document.getElementById('tableContainer').style.display = 'none';
+        document.getElementById('topList').innerHTML = '';
+        document.getElementById('bottomList').innerHTML = '';
+        document.getElementById('tableBody').innerHTML = '';
+
+        try {
+            const url = `${BASE_API}&range=${range}`;
+            const response = await fetch(url);
+            if (!response.ok) throw new Error('网络请求失败');
+            
+            const data = await response.json();
+            const events = data.breakdowns?.event || [];
+            
+            let games = events
+                .filter(item => item.name.startsWith('play-game'))
+                .map(item => ({
+                    name: item.name.replace('play-game_', '').replace('play-game', '未知游戏'),
+                    count: item.value
+                }))
+                .sort((a, b) => b.count - a.count);
+
+            const totalViews = games.reduce((sum, item) => sum + item.count, 0);
+
+            if (games.length === 0) {
+                document.getElementById('loading').innerText = '当前时间段暂无游戏数据';
+                return;
+            }
+
+            document.getElementById('loading').style.display = 'none';
+
+            if (limitType === 'all') {
+                document.getElementById('tableContainer').style.display = 'block';
+                renderFullTable(games, totalViews);
+            } else {
+                const n = parseInt(limitType);
+                document.getElementById('rankContainer').style.display = 'grid';
+                renderRank('topList', games.slice(0, n), true);
+                const bottomN = games.slice(-n).reverse();
+                renderRank('bottomList', bottomN, false);
+            }
+
+        } catch (err) {
+            console.error(err);
+            document.getElementById('loading').style.display = 'none';
+            document.getElementById('error').style.display = 'block';
+        }
+    }
+
+    function createRow(item, index, isTop, maxCount) {
+        const div = document.createElement('div');
+        div.className = 'list-item';
+        
+        let rankClass = 'rank';
+        if (isTop && index < 3) rankClass += ` rank-${index + 1}`;
+
+        div.innerHTML = `
+            <div class="game-name">
+                <span class="${rankClass}">${index + 1}</span>
+                <span>${item.name}</span>
+            </div>
+            <div class="game-value">${item.count} 次</div>
+        `;
+        return div;
+    }
+
+    function renderRank(containerId, list, isTop) {
+        const container = document.getElementById(containerId);
+        const maxCount = Math.max(...list.map(i => i.count));
+        
+        list.forEach((item, index) => {
+            container.appendChild(createRow(item, index, isTop, maxCount));
+        });
+    }
+
+    function renderFullTable(games, totalViews) {
+        const tbody = document.getElementById('tableBody');
+        games.forEach((item, index) => {
+            const tr = document.createElement('tr');
+            const percent = totalViews > 0 ? ((item.count / totalViews) * 100).toFixed(1) : 0;
+            
+            tr.innerHTML = `
+                <td style="color: var(--text-muted);">${index + 1}</td>
+                <td style="font-weight: 500;">${item.name}</td>
+                <td style="color: var(--primary); font-weight: bold;">${item.count}</td>
+                <td style="color: var(--text-muted);">${percent}%</td>
+            `;
+            tbody.appendChild(tr);
+        });
+    }
+
+    fetchData();
+</script>
+</body>
+</html>

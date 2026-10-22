@@ -78,6 +78,9 @@ const RESERVED_PATHS = new Set([
 ]);
 
 const DOMAIN_PATTERN = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/;
+const CORS_ALLOW_ORIGIN = 'https://game.leleleling.site';
+const CORS_ALLOW_METHODS = 'GET, POST, OPTIONS';
+const CORS_ALLOW_HEADERS = 'Content-Type, Authorization';
 
 /**
  * The `src` the console prints in its install snippet.
@@ -94,6 +97,22 @@ type AppEnv = { Bindings: Env; Variables: { user: UserRow } };
 type AppContext = Context<AppEnv>;
 
 const app = new Hono<AppEnv>();
+
+function addCorsHeaders(response: Response, request: Request): Response {
+  const headers = new Headers(response.headers);
+  const origin = request.headers.get('Origin');
+
+  headers.set('Access-Control-Allow-Origin', origin === CORS_ALLOW_ORIGIN ? origin : CORS_ALLOW_ORIGIN);
+  headers.set('Access-Control-Allow-Methods', CORS_ALLOW_METHODS);
+  headers.set('Access-Control-Allow-Headers', CORS_ALLOW_HEADERS);
+  headers.set('Access-Control-Max-Age', '86400');
+
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers,
+  });
+}
 
 /** Writing the filter cube can be turned off on very high-traffic instances. */
 function cubeEnabled(env: Env): boolean {
@@ -200,8 +219,25 @@ function securityHeaders(scriptSrc: string): Record<string, string> {
 const PAGE_HEADERS = securityHeaders("'none'");
 
 app.use('*', async (c, next) => {
+  const request = c.req.raw;
+
+  if (request.method === 'OPTIONS') {
+    const headers = new Headers();
+    headers.set('Access-Control-Allow-Origin', CORS_ALLOW_ORIGIN);
+    headers.set('Access-Control-Allow-Methods', CORS_ALLOW_METHODS);
+    headers.set('Access-Control-Allow-Headers', CORS_ALLOW_HEADERS);
+    headers.set('Access-Control-Max-Age', '86400');
+    c.res = new Response(null, { status: 204, headers });
+    return;
+  }
+
   await ensureSchema(c.env.DB);
   await next();
+
+  const response = c.res;
+  if (response) {
+    c.res = addCorsHeaders(response, request);
+  }
 });
 
 app.onError((err, c) => {

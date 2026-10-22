@@ -81,6 +81,7 @@ const DOMAIN_PATTERN = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z
 const CORS_ALLOW_ORIGIN = 'https://game.leleleling.site';
 const CORS_ALLOW_METHODS = 'GET, POST, OPTIONS';
 const CORS_ALLOW_HEADERS = 'Content-Type, Authorization';
+const PUBLIC_API_PATHS = new Set(['/api/breakdown', '/api/summary', '/api/timeseries', '/api/realtime']);
 
 /**
  * The `src` the console prints in its install snippet.
@@ -254,6 +255,7 @@ app.post('/api/event', (c) => handleIngest(c.req.raw, c.env));
 
 app.use('/api/*', async (c, next) => {
   if (c.req.path === '/api/event' || c.req.path.startsWith('/api/fonts/')) return next();
+  if (PUBLIC_API_PATHS.has(c.req.path)) return next();
 
   const user = await loadUser(c.env, getCookie(c, SESSION_COOKIE));
   if (!user) return c.json({ error: 'unauthorized' }, 401);
@@ -513,7 +515,18 @@ app.delete('/api/users/:id', async (c) => {
 type SiteRow = Awaited<ReturnType<typeof accessibleSites>>[number];
 
 async function resolveSite(c: AppContext): Promise<SiteRow | Response> {
-  const user = c.get('user');
+  const user =
+    c.get('user') ??
+    ({
+      id: 0,
+      email: 'public@localhost',
+      password_hash: '',
+      password_salt: '',
+      role: 'owner',
+      token_version: 0,
+      created_at: 0,
+    } as UserRow);
+
   const sites = await accessibleSites(c.env.DB, user);
   if (sites.length === 0) return c.json({ error: 'no sites available' }, 404);
 

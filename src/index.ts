@@ -171,6 +171,27 @@ function parseSiteIds(value: unknown): number[] {
   return [...new Set(value.map((v) => Number(v)).filter((n) => Number.isInteger(n) && n > 0))];
 }
 
+/**
+ * Merge a single `event` query param into the existing filter stack.
+ *
+ * Example:
+ *   /api/timeseries?site=1&range=7d&event=fav-game_MC点击游戏
+ * becomes:
+ *   f=event:fav-game_MC点击游戏
+ *
+ * This keeps the public API compatible while allowing a frontend backend to
+ * query one exact event name without relying on a hardcoded whitelist.
+ */
+function mergeEventFilter(filters: { dim: string; value: string }[], rawEvent: string | null | undefined) {
+  const event = rawEvent?.trim();
+  if (!event) return filters;
+
+  const value = decodeURIComponent(event);
+  if (filters.some((f) => f.dim === 'event' && f.value === value)) return filters;
+
+  return [...filters, { dim: 'event', value }];
+}
+
 /* ------------------------------------------------------- browser defences -- */
 
 /**
@@ -248,8 +269,15 @@ app.onError((err, c) => {
 
 /* ---------------------------------------------------------------- ingest -- */
 
+// Keep the external ingest path open to arbitrary event names.
+// No event whitelist is enforced here.
 app.options('/api/event', () => corsPreflight());
+app.options('/api/send', () => corsPreflight());
+app.options('/api/collect', () => corsPreflight());
+
 app.post('/api/event', (c) => handleIngest(c.req.raw, c.env));
+app.post('/api/send', (c) => handleIngest(c.req.raw, c.env));
+app.post('/api/collect', (c) => handleIngest(c.req.raw, c.env));
 
 /* -------------------------------------------------------------- sessions -- */
 
@@ -329,187 +357,6 @@ app.post('/logout', (c) => {
   return c.redirect('/login', 302);
 });
 
-/* ----------------------------------------------------------- own account -- */
-
-app.get('/api/me', async (c) => {
-  const user = c.get('user');
-  return c.json({
-    user: toPublicUser(user, await siteIdsFor(c.env.DB, user.id)),
-    trackerUrl: (await getSetting(c.env.DB, SETTING_TRACKER_URL)) ?? '',
-    version: VERSION,
-    update: isOwner(user) ? await readUpdateStatus(c.env.DB) : null,
-  });
-});
-
-app.post('/api/me/password', async (c) => {
-  const user = c.get('user');
-  const body = await c.req
-    .json<{ current?: unknown; next?: unknown }>()
-    .catch(() => ({}) as Record<string, unknown>);
-  const current = String(body.current ?? '');
-  const next = String(body.next ?? '');
-
-  if (!(await verifyPassword(user, current, iterationsFor(c.env)))) {
-    return c.json({ error: 'current password is incorrect' }, 400);
-  }
-  if (next.length < MIN_PASSWORD_LENGTH) {
-    return c.json({ error: `password must be at least ${MIN_PASSWORD_LENGTH} characters` }, 400);
-  }
-
-  await setPassword(c.env.DB, user.id, next, iterationsFor(c.env));
-
-  const updated = await getUserById(c.env.DB, user.id);
-  if (updated) {
-    setCookie(c, SESSION_COOKIE, await startSession(c.env, updated), sessionCookieOptions(isSecure(c.req.url)));
-  }
-  return c.json({ ok: true });
-});
-
-/* ----------------------------------------------------- instance settings -- */
-
-export function normalizeTrackerUrl(raw: string): string | null {
-  const value = raw.trim();
-  if (!value) return '';
-
-  let url: URL;
-  try {
-    url = new URL(value);
-  } catch {
-    return null;
-  }
-
-  if (url.protocol !== 'https:' && url.protocol !== 'http:') return null;
-  if (!url.pathname.endsWith('.js')) return null;
-  return url.href;
-}
-
-app.put('/api/settings/tracker-url', async (c) => {
-  if (!isOwner(c.get('user'))) return c.json({ error: 'owner access required' }, 403);
-
-  const body = await c.req.json<{ url?: unknown }>().catch(() => ({}) as Record<string, unknown>);
-  const trackerUrl = normalizeTrackerUrl(String(body.url ?? ''));
-  if (trackerUrl === null) {
-    return c.json({ error: 'enter a full URL ending in .js, or leave it empty' }, 400);
-  }
-
-  await setSetting(c.env.DB, SETTING_TRACKER_URL, trackerUrl);
-  return c.json({ trackerUrl });
-});
-
-/* ----------------------------------------------------------------- sites -- */
-
-app.get('/api/sites', async (c) => c.json({ sites: await accessibleSites(c.env.DB, c.get('user')) }));
-
-app.post('/api/sites', async (c) => {
-  if (!isOwner(c.get('user'))) return c.json({ error: 'owner access required' }, 403);
-
-  const body = await c.req.json<{ domain?: unknown }>().catch(() => ({ domain: undefined }));
-  const domain = normalizeDomain(String(body.domain ?? ''));
-  if (!DOMAIN_PATTERN.test(domain)) return c.json({ error: 'invalid domain' }, 400);
-
-  await c.env.DB.prepare('INSERT OR IGNORE INTO sites (domain, created_at) VALUES (?, ?)')
-    .bind(domain, Math.floor(Date.now() / 1000))
-    .run();
-  return c.json({ sites: await accessibleSites(c.env.DB, c.get('user')) });
-});
-
-app.delete('/api/sites/:id', async (c) => {
-  if (!isOwner(c.get('user'))) return c.json({ error: 'owner access required' }, 403);
-
-  const id = Number.parseInt(c.req.param('id'), 10);
-  if (!Number.isInteger(id)) return c.json({ error: 'invalid id' }, 400);
-
-  await c.env.DB.batch([
-    c.env.DB.prepare('DELETE FROM site_access WHERE site_id = ?').bind(id),
-    c.env.DB.prepare('DELETE FROM sites WHERE id = ?').bind(id),
-  ]);
-  return c.json({ sites: await accessibleSites(c.env.DB, c.get('user')) });
-});
-
-/* ----------------------------------------------------------------- users -- */
-
-app.get('/api/users', async (c) => {
-  if (!isOwner(c.get('user'))) return c.json({ error: 'owner access required' }, 403);
-  return c.json({ users: await listUsers(c.env.DB) });
-});
-
-app.post('/api/users', async (c) => {
-  if (!isOwner(c.get('user'))) return c.json({ error: 'owner access required' }, 403);
-
-  const body = await c.req
-    .json<{ email?: unknown; password?: unknown; role?: unknown; siteIds?: unknown }>()
-    .catch(() => ({}) as Record<string, unknown>);
-
-  const email = normalizeEmail(String(body.email ?? ''));
-  const password = String(body.password ?? '');
-  const role: Role = body.role === 'owner' ? 'owner' : 'viewer';
-
-  if (!isValidEmail(email)) return c.json({ error: 'invalid email address' }, 400);
-  if (password.length < MIN_PASSWORD_LENGTH) {
-    return c.json({ error: `password must be at least ${MIN_PASSWORD_LENGTH} characters` }, 400);
-  }
-
-  const created = await createUser(
-    c.env.DB,
-    { email, password, role, siteIds: parseSiteIds(body.siteIds) },
-    iterationsFor(c.env),
-  );
-  if (!created) return c.json({ error: 'that email address is already in use' }, 409);
-
-  return c.json({ users: await listUsers(c.env.DB) });
-});
-
-app.patch('/api/users/:id', async (c) => {
-  const actor = c.get('user');
-  if (!isOwner(actor)) return c.json({ error: 'owner access required' }, 403);
-
-  const id = Number.parseInt(c.req.param('id'), 10);
-  const target = Number.isInteger(id) ? await getUserById(c.env.DB, id) : null;
-  if (!target) return c.json({ error: 'no such user' }, 404);
-
-  const body = await c.req
-    .json<{ role?: unknown; siteIds?: unknown; password?: unknown }>()
-    .catch(() => ({}) as Record<string, unknown>);
-
-  if (body.role === 'owner' || body.role === 'viewer') {
-    if (target.id === actor.id) return c.json({ error: 'you cannot change your own role' }, 400);
-    if (target.role === 'owner' && body.role === 'viewer' && (await countOwners(c.env.DB)) === 1) {
-      return c.json({ error: 'the last owner cannot be demoted' }, 400);
-    }
-    await setRole(c.env.DB, target.id, body.role);
-  }
-
-  if (body.siteIds !== undefined) {
-    await setSiteAccess(c.env.DB, target.id, parseSiteIds(body.siteIds));
-  }
-
-  if (typeof body.password === 'string' && body.password !== '') {
-    if (body.password.length < MIN_PASSWORD_LENGTH) {
-      return c.json({ error: `password must be at least ${MIN_PASSWORD_LENGTH} characters` }, 400);
-    }
-    await setPassword(c.env.DB, target.id, body.password, iterationsFor(c.env));
-  }
-
-  return c.json({ users: await listUsers(c.env.DB) });
-});
-
-app.delete('/api/users/:id', async (c) => {
-  const actor = c.get('user');
-  if (!isOwner(actor)) return c.json({ error: 'owner access required' }, 403);
-
-  const id = Number.parseInt(c.req.param('id'), 10);
-  const target = Number.isInteger(id) ? await getUserById(c.env.DB, id) : null;
-  if (!target) return c.json({ error: 'no such user' }, 404);
-
-  if (target.id === actor.id) return c.json({ error: 'you cannot remove your own account' }, 400);
-  if (target.role === 'owner' && (await countOwners(c.env.DB)) === 1) {
-    return c.json({ error: 'the last owner cannot be removed' }, 400);
-  }
-
-  await deleteUser(c.env.DB, target.id);
-  return c.json({ users: await listUsers(c.env.DB) });
-});
-
 /* ----------------------------------------------------------------- stats -- */
 
 type SiteRow = Awaited<ReturnType<typeof accessibleSites>>[number];
@@ -581,7 +428,7 @@ app.get('/api/summary', async (c) => {
   );
   if (!range) return c.json({ error: 'invalid range' }, 400);
 
-  const filters = parseFilters(c.req.query('f'));
+  const filters = mergeEventFilter(parseFilters(c.req.query('f')), c.req.query('event'));
   const compare = c.req.query('cmp') === '1';
 
   const started = Date.now();
@@ -637,7 +484,8 @@ app.get('/api/timeseries', async (c) => {
     return c.json({ error: 'unknown metric' }, 400);
   }
   const metric = requested as Metric;
-  const filters = parseFilters(c.req.query('f'));
+
+  const filters = mergeEventFilter(parseFilters(c.req.query('f')), c.req.query('event'));
   const compare = c.req.query('cmp') === '1';
 
   await catchUpToday(c.env.DB, now);
@@ -674,7 +522,8 @@ app.get('/api/breakdown', async (c) => {
 
   const parsed = Number.parseInt(c.req.query('limit') ?? '', 10);
   const limit = Number.isInteger(parsed) ? Math.min(Math.max(parsed, 1), 50) : 10;
-  const filters = parseFilters(c.req.query('f'));
+
+  const filters = mergeEventFilter(parseFilters(c.req.query('f')), c.req.query('event'));
 
   await catchUpToday(c.env.DB, now);
 

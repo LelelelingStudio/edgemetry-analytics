@@ -302,6 +302,18 @@ const CUBE_COMPONENTS = `COALESCE(SUM(pageviews), 0) AS views,
 /** The same sums, for custom events: a firing is a pageview and nothing else. */
 const EVENT_COMPONENTS = `COUNT(*) AS views, 0 AS visits, 0 AS bounces, 0 AS duration`;
 
+/**
+ * The event sums for a *pre-aggregated* source.
+ *
+ * `EVENT_COMPONENTS` counts rows, which is right for the raw tables (one row
+ * per firing) and wrong for the cube (one row per dimension tuple, holding the
+ * fold in `pageviews`). Counting cube rows answers "how many distinct paths did
+ * this event fire on" rather than "how many times did it fire", which is the
+ * other half of why a game's daily total came back short.
+ */
+const EVENT_CUBE_COMPONENTS = `COALESCE(SUM(pageviews), 0) AS views,
+   0 AS visits, 0 AS bounces, 0 AS duration`;
+
 interface ComponentRow extends Components {
   label: string;
 }
@@ -349,8 +361,16 @@ async function dailyComponents(
   const events = countsEventViews(metric, filters);
 
   if (from <= historyTo) {
+    // When the event *is* the measure, the cube must exclude pageview rows for
+    // the same reason the raw reader does: `filterClause` names `pageview`
+    // alongside the event so an incidental event filter still matches the
+    // pageview rows it is narrowing, and taking that at face value here folds
+    // the whole site's pageviews into one event's firing count. The cube has no
+    // `name = 'pageview'` of its own to narrow it back down, so it is said
+    // explicitly. Without this, asking for an event that does not exist at all
+    // answered with a site-wide pageview total instead of zero.
     const source = events
-      ? `${cubeEventsBetween(from, historyTo)} AND site_id = ?${where}`
+      ? `${cubeEventsBetween(from, historyTo)} AND site_id = ? AND name <> 'pageview'${where}`
       : `stats_cube
            WHERE site_id = ? AND name = 'pageview' AND day BETWEEN ? AND ?${where}`;
     // The event source carries its own day bounds as literals, so only the
@@ -364,7 +384,7 @@ async function dailyComponents(
       ? (
           await db
             .prepare(
-              `SELECT day, ${events ? EVENT_COMPONENTS : CUBE_COMPONENTS}
+              `SELECT day, ${events ? EVENT_CUBE_COMPONENTS : CUBE_COMPONENTS}
                FROM ${source}
                GROUP BY day`,
             )

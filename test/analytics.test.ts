@@ -743,6 +743,42 @@ describe('the event a timeseries was opened on', () => {
     return (await response.json()) as Series;
   }
 
+  it('answers an event that never fired with zero, not the site pageviews', async () => {
+    await seedTwoGames();
+
+    // The cube is read with a predicate that names `pageview` so an incidental
+    // event filter still matches the pageview rows it narrows. When the event
+    // *is* the measure that predicate has to be narrowed back down, or a name
+    // that never fired matches the pageview rows instead and answers with the
+    // whole site's traffic. Both the history (cube) and today (raw) halves are
+    // checked, because the two take different code paths.
+    const series = await timeseries(
+      `range=custom&from=${from}&to=${partsFor(now).day}&event=play-chess-does-not-exist`,
+    );
+
+    expect(series.points.map((p) => p.cur)).toEqual([0, 0, 0]);
+  });
+
+  it('counts a game fired from several pages by its firings, not by distinct paths', async () => {
+    await seedTwoGames();
+
+    // The cube holds one row per dimension tuple, so `play-chess` played twice
+    // from /chess is a single row carrying two firings. Counting cube rows
+    // instead of summing them answers 1 — the number of paths it was played on
+    // — where the question is how often it was played. A day-quantised read is
+    // what reaches the cube, so that is the shape asked for here.
+    const rows = await db
+      .prepare("SELECT COUNT(*) AS n, SUM(pageviews) AS pv FROM stats_cube WHERE name = 'play-chess'")
+      .all<{ n: number; pv: number }>();
+    expect(rows.results[0]).toEqual({ n: 1, pv: 2 });
+
+    const series = await timeseries(
+      `range=custom&from=${from}&to=${partsFor(now).day}&event=play-chess`,
+    );
+    // Two firings on the finished day, one today.
+    expect(series.points.find((p) => p.label === yesterday)?.cur).toBe(2);
+  });
+
   it('counts only the named game, on a finished day and on today', async () => {
     await seedTwoGames();
 
@@ -766,11 +802,14 @@ describe('the event a timeseries was opened on', () => {
 
     // Three events on the finished day and one so far today, no pageviews.
     expect(all.points.map((p) => p.cur)).toEqual([0, 3, 1]);
-    // The comparison window is the same two days a week earlier, and two
-    // play-go firings landed on its equivalent of the finished day.
+    // One play-go firing on the finished day — `bbb` fired it once. This used
+    // to read 2, because the cube was counted with `COUNT(*)` over a predicate
+    // that also named `pageview`, so the finished day's single pageview was
+    // added to the game's one firing. The visit-less `ccc` pageview that opens
+    // today is not a play-go either, so today stays 0.
     expect(one.points.map((p) => [p.cur, p.prev])).toEqual([
       [0, 0],
-      [2, 0],
+      [1, 0],
       [0, 0],
     ]);
   });

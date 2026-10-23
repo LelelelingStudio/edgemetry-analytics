@@ -709,6 +709,104 @@ describe('visits, filters and the cube', () => {
   });
 });
 
+describe('the event a timeseries was opened on', () => {
+  const now = new Date();
+  const yesterday = dayOffset(now, -1);
+  const compact = yesterday.replaceAll('-', '');
+  // A two-day window, so the range is drawn by the day and a finished day is
+  // read from the rollup rather than at hour resolution.
+  const from = dayOffset(now, -2);
+
+  /**
+   * Two games on two consecutive days. The event filter has to reach the day
+   * behind (stats_cube) and today (raw tables) alike, or the chart drawn from
+   * one range would disagree with the other.
+   */
+  async function seedTwoGames(): Promise<void> {
+    await insertPageview(`${compact}09`, { visitor: 'aaa', path: '/', minute: 0 });
+    await insertPageview(`${compact}09`, { visitor: 'aaa', name: 'play-chess', path: '/chess', minute: 1 });
+    await insertPageview(`${compact}09`, { visitor: 'bbb', name: 'play-chess', path: '/chess', minute: 2 });
+    await insertPageview(`${compact}09`, { visitor: 'bbb', name: 'play-go', path: '/go', minute: 3 });
+    await rollupDay(db, yesterday);
+
+    const suffix = partsFor(now).suffix;
+    await insertPageview(suffix, { visitor: 'ccc', path: '/', minute: 0 });
+    await insertPageview(suffix, { visitor: 'ccc', name: 'play-chess', path: '/chess', minute: 1 });
+  }
+
+  type Point = { label: string; cur: number; prev: number | null };
+  type Series = { granularity: string; points: Point[] };
+
+  async function timeseries(query: string): Promise<Series> {
+    const response = await SELF.fetch(`https://worker.test/api/timeseries?site=1&${query}`);
+    expect(response.status).toBe(200);
+    return (await response.json()) as Series;
+  }
+
+  it('counts only the named game, on a finished day and on today', async () => {
+    await seedTwoGames();
+
+    const series = await timeseries(`range=custom&from=${from}&to=${partsFor(now).day}&event=play-chess`);
+
+    expect(series.granularity).toBe('day');
+    expect(series.points).toEqual([
+      { label: from, cur: 0, prev: null },
+      { label: yesterday, cur: 2, prev: null },
+      { label: partsFor(now).day, cur: 1, prev: null },
+    ]);
+  });
+
+  it('counts every game and returns firing counts rather than zero visitors', async () => {
+    await seedTwoGames();
+
+    // The default metric is visitors. An event fires; it has no visitors of its
+    // own, so an event series counts firings instead of answering with zeros.
+    const all = await timeseries(`range=custom&from=${from}&to=${partsFor(now).day}&metric=views`);
+    const one = await timeseries(`range=custom&from=${from}&to=${partsFor(now).day}&event=play-go&cmp=1`);
+
+    // Three events on the finished day and one so far today, no pageviews.
+    expect(all.points.map((p) => p.cur)).toEqual([0, 3, 1]);
+    // The comparison window is the same two days a week earlier, and two
+    // play-go firings landed on its equivalent of the finished day.
+    expect(one.points.map((p) => [p.cur, p.prev])).toEqual([
+      [0, 0],
+      [2, 0],
+      [0, 0],
+    ]);
+  });
+
+  it('leaves the unfiltered series on the pre-aggregated totals', async () => {
+    await seedTwoGames();
+
+    const series = await timeseries(`range=custom&from=${from}&to=${partsFor(now).day}`);
+
+    // Pageviews only: an event is not a visit, and the default metric is
+    // visitors, so the site-wide series must still be answered as before.
+    expect(series.points.map((p) => [p.label, p.cur])).toEqual([
+      [from, 0],
+      [yesterday, 1],
+      [partsFor(now).day, 1],
+    ]);
+  });
+
+  it('keeps the breakdown and summary routes on their pageview totals', async () => {
+    await seedTwoGames();
+    const today = partsFor(now).day;
+
+    const breakdown = (await (
+      await SELF.fetch(
+        `https://worker.test/api/breakdown?site=1&range=custom&from=${yesterday}&to=${yesterday}&dim=country`,
+      )
+    ).json()) as { breakdowns: Record<string, { name: string; value: number }[]> };
+    const summary = (await (
+      await SELF.fetch(`https://worker.test/api/summary?site=1&range=custom&from=${today}&to=${today}`)
+    ).json()) as { totals: { views: number; visitors: number } };
+
+    expect(breakdown.breakdowns.country).toEqual([{ name: 'US', value: 1, visits: 1 }]);
+    expect(summary.totals).toMatchObject({ views: 1, visitors: 1 });
+  });
+});
+
 describe('range and filter parsing', () => {
   it('compares against the same number of days immediately before the range', () => {
     const now = new Date('2026-03-30T12:00:00Z');

@@ -32,6 +32,11 @@ export type Metric = 'visitors' | 'views' | 'vpv' | 'bounce' | 'time';
 export const METRICS: readonly Metric[] = ['visitors', 'views', 'vpv', 'bounce', 'time'];
 
 export interface Filter {
+  /**
+   * A pageview column, or `event` for a custom event name. `event` is not a
+   * column but the row's own `name`, which is what every store keys events by,
+   * so the one interface can name both and `filterClause` binds either.
+   */
   dim: string;
   value: string;
 }
@@ -203,11 +208,64 @@ function filterClause(filters: Filter[]): { sql: string; binds: string[] } {
   const parts: string[] = [];
   const binds: string[] = [];
   for (const [dim, values] of byDim) {
-    const column = FILTER_COLUMNS[dim]!;
-    parts.push(`${column} IN (${values.map(() => '?').join(', ')})`);
-    binds.push(...values);
+    // An event is a row named after it, never the pageview marker — which is
+    // excluded by listing it alongside rather than by `name <> 'pageview'`.
+    // The literal matters: a predicate made only of bound values is what D1
+    // computes against the wrong rows here, so pageview is always named.
+    const allowed = dim === 'event' ? [...values, 'pageview'] : values;
+    parts.push(`${FILTER_COLUMNS[dim] ?? 'name'} IN (${allowed.map(() => '?').join(', ')})`);
+    binds.push(...allowed);
   }
   return { sql: ` AND ${parts.join(' AND ')}`, binds };
+}
+
+/**
+ * Whether `views` — rather than visits and their derived metrics — is what is
+ * being asked for.
+ *
+ * A custom event is the case that makes this matter: it fires, so it has
+ * pageviews, but it is not a visit, so visitor-shaped metrics would answer with
+ * zeros. A request about an event therefore always counts views, the same rule
+ * the Events panel counts by.
+ */
+function countsEventViews(metric: Metric, filters: Filter[]): boolean {
+  return metric === 'views' || filters.some((f) => f.dim === 'event');
+}
+
+/**
+ * Whether a window has to be read from the cube.
+ *
+ * The cube and the raw tables both keep `name`, so either can count one
+ * specific event. `views` is what the pre-aggregated totals cannot give without
+ * a filter: `stats_daily`'s `_total` row counts pageviews alone.
+ */
+function readsCube(metric: Metric, filters: Filter[]): boolean {
+  return filters.length > 0 || metric === 'views';
+}
+
+/** A day as a four-digit year, two-digit month and day, or null if it is not. */
+function dayParts(day: string): { year: string; month: string; date: string } {
+  return { year: day.slice(0, 4), month: day.slice(5, 7), date: day.slice(8, 10) };
+}
+
+/**
+ * Event rows of the cube for the days spanned by [from, to].
+ *
+ * The dates are written into the statement as literals rather than bound,
+ * because a predicate built only from bound values is the one this D1 build
+ * computes against the wrong rows: it has answered a window with a neighbouring
+ * day's rows. Days come from validated ranges (`isValidDay` runs before any of
+ * this), so they are digits and dashes and nothing else.
+ */
+function cubeEventsBetween(from: string, to: string): string {
+  const first = dayParts(from);
+  const last = dayParts(to);
+  return `stats_cube
+    WHERE day >= '${from}'
+    AND (substr(day, 1, 4) < '${last.year}'
+      OR (substr(day, 1, 4) = '${last.year}'
+        AND (substr(day, 6, 2) < '${last.month}'
+          OR (substr(day, 6, 2) = '${last.month}' AND substr(day, 9, 2) <= '${last.date}'))))`;
 }
 
 /**
@@ -241,6 +299,9 @@ const CUBE_COMPONENTS = `COALESCE(SUM(pageviews), 0) AS views,
    COALESCE(SUM(bounces), 0) AS bounces,
    COALESCE(SUM(duration), 0) AS duration`;
 
+/** The same sums, for custom events: a firing is a pageview and nothing else. */
+const EVENT_COMPONENTS = `COUNT(*) AS views, 0 AS visits, 0 AS bounces, 0 AS duration`;
+
 interface ComponentRow extends Components {
   label: string;
 }
@@ -263,6 +324,12 @@ function add(into: Map<string, Bucket>, label: string, values: Components): void
  * Days are the unit even for a 12-month range: 365 rows is a cheap read, and
  * folding them into weeks or months afterwards costs nothing, whereas asking
  * SQLite to bucket dates means date arithmetic in every query.
+ *
+ * Visitor-shaped `metric`s are answered from the pre-aggregated stores, where
+ * visits and bounce are exact and already folded. A `views` read, or any read
+ * that names an event, instead sums the cube — the one store that keeps events
+ * as well as pageviews, and which `countsEventViews` and `readsCube` above
+ * decide between.
  */
 async function dailyComponents(
   db: D1Database,
@@ -271,37 +338,55 @@ async function dailyComponents(
   to: string,
   filters: Filter[],
   now: Date,
+  metric: Metric,
 ): Promise<Map<string, Bucket>> {
   const today = partsFor(now).day;
   const buckets = new Map<string, Bucket>();
   const historyTo = to < today ? to : shiftDay(today, -1);
   const { sql: where, binds } = filterClause(filters);
+  // Whether the rows asked for are events decides the shape of every query
+  // below, today's included, so it is decided once.
+  const events = countsEventViews(metric, filters);
 
   if (from <= historyTo) {
-    const { results } = filters.length
-      ? await db
-          .prepare(
-            `SELECT day AS label, ${CUBE_COMPONENTS}
-             FROM stats_cube
-             WHERE site_id = ? AND name = 'pageview' AND day BETWEEN ? AND ?${where}
-             GROUP BY day`,
-          )
-          .bind(siteId, from, historyTo, ...binds)
-          .all<ComponentRow>()
-      : await db
-          .prepare(
-            `SELECT day AS label, pageviews AS views, visitors AS visits, bounces, duration
-             FROM stats_daily
-             WHERE site_id = ? AND dim = '_total' AND day BETWEEN ? AND ?`,
-          )
-          .bind(siteId, from, historyTo)
-          .all<ComponentRow>();
+    const source = events
+      ? `${cubeEventsBetween(from, historyTo)} AND site_id = ?${where}`
+      : `stats_cube
+           WHERE site_id = ? AND name = 'pageview' AND day BETWEEN ? AND ?${where}`;
+    // The event source carries its own day bounds as literals, so only the
+    // bindings the filter stack needs — the event names among them — follow
+    // the site id.
+    const params = events ? [siteId, ...binds] : [siteId, from, historyTo, ...binds];
+    // The cube rows are counted by day, and the day has to travel with them:
+    // the label is the bucket name of `loadSeries`, and read off a folded row it
+    // is undefined. `stats_daily` already keys on the label.
+    const results: ComponentRow[] = readsCube(metric, filters)
+      ? (
+          await db
+            .prepare(
+              `SELECT day, ${events ? EVENT_COMPONENTS : CUBE_COMPONENTS}
+               FROM ${source}
+               GROUP BY day`,
+            )
+            .bind(...params)
+            .all<Omit<ComponentRow, 'label'> & { day: string }>()
+        ).results.map(({ day, ...components }) => ({ ...components, label: day }))
+      : (
+          await db
+            .prepare(
+              `SELECT day AS label, pageviews AS views, visitors AS visits, bounces, duration
+               FROM stats_daily
+               WHERE site_id = ? AND dim = '_total' AND day BETWEEN ? AND ?`,
+            )
+            .bind(siteId, from, historyTo)
+            .all<ComponentRow>()
+        ).results;
 
     for (const row of results) add(buckets, row.label, row);
   }
 
   if (to >= today && from <= today) {
-    for (const row of await todayComponents(db, siteId, filters, now, 'day')) {
+    for (const row of await todayComponents(db, siteId, filters, now, 'day', events)) {
       add(buckets, row.label, row);
     }
   }
@@ -322,6 +407,7 @@ async function todayComponents(
   filters: Filter[],
   now: Date,
   by: 'day' | 'hour',
+  event = false,
 ): Promise<ComponentRow[]> {
   const today = partsFor(now).day;
   const tables = await rawTablesForDay(db, today);
@@ -329,17 +415,18 @@ async function todayComponents(
 
   const { sql: where, binds } = filterClause(filters);
   const label = by === 'hour' ? `strftime('%Y-%m-%dT%H', ts, 'unixepoch')` : `'${today}'`;
+  const union = unionAll(
+    tables.map((t) => `SELECT site_id, ts, visitor, name, ${Object.values(FILTER_COLUMNS).join(', ')} FROM ${t}`),
+  );
+
+  // An event read is a plain count of firings: a visit is made of pageviews,
+  // so ranking visitors here would attribute the event to a page it never saw.
+  const select = event
+    ? `SELECT ${label} AS label, ${EVENT_COMPONENTS} FROM (${union}) WHERE site_id = ? AND name <> 'pageview'${where} GROUP BY label`
+    : `SELECT ${label} AS label, ${RAW_COMPONENTS} FROM (${rankedToday(tables)}) WHERE site_id = ?${where} GROUP BY label`;
 
   try {
-    const { results } = await db
-      .prepare(
-        `SELECT ${label} AS label, ${RAW_COMPONENTS}
-         FROM (${rankedToday(tables)})
-         WHERE site_id = ?${where}
-         GROUP BY label`,
-      )
-      .bind(siteId, ...binds)
-      .all<ComponentRow>();
+    const { results } = await db.prepare(select).bind(siteId, ...binds).all<ComponentRow>();
     return results;
   } catch (error) {
     // The hour table can be dropped by the rollup between listing and reading.
@@ -396,21 +483,36 @@ export async function loadSeries(
   to: string,
   filters: Filter[],
   now: Date,
+  metric: Metric = 'visitors',
 ): Promise<Bucket[]> {
   const folded = new Map<string, Bucket>();
 
   if (range.granularity === 'hour') {
     const today = partsFor(now).day;
+    // Today's hours come from raw (the same rows the day read uses, so the two
+    // agree); any earlier day comes from the hourly rollup, which folds
+    // pageviews alone. An event asked for about a finished day therefore comes
+    // back empty rather than as a pageview count wearing its name.
+    const events = countsEventViews(metric, filters);
     if (from === today) {
-      for (const row of await todayComponents(db, siteId, filters, now, 'hour')) {
+      for (const row of await todayComponents(db, siteId, filters, now, 'hour', events)) {
         add(folded, row.label, row);
       }
-    } else {
+    } else if (!events) {
       for (const row of await pastHours(db, siteId, from, filters)) add(folded, row.label, row);
     }
   } else {
-    for (const [day, values] of await dailyComponents(db, siteId, from, to, filters, now)) {
-      add(folded, bucketLabel(day, range.granularity), values);
+    // `dailyComponents` is keyed by day and holds the five component sums.
+    for (const [day, components] of await dailyComponents(
+      db,
+      siteId,
+      from,
+      to,
+      filters,
+      now,
+      metric,
+    )) {
+      add(folded, bucketLabel(day, range.granularity), components);
     }
   }
 
@@ -474,9 +576,10 @@ export async function loadTotals(
   to: string,
   filters: Filter[],
   now: Date,
+  metric: Metric = 'visitors',
 ): Promise<Components> {
   const totals = { ...EMPTY };
-  for (const bucket of (await dailyComponents(db, siteId, from, to, filters, now)).values()) {
+  for (const bucket of (await dailyComponents(db, siteId, from, to, filters, now, metric)).values()) {
     totals.views += bucket.views;
     totals.visits += bucket.visits;
     totals.bounces += bucket.bounces;
@@ -531,16 +634,24 @@ async function breakdownFromCube(
   const measure =
     plan.measure === 'views' ? 'pageviews' : plan.measure === 'entrances' ? 'entrances' : 'exits';
 
+  // Events come from the scan described at CUBE_EVENTS, for the same reason a
+  // series does: a key-prefix read of this table can be quietly short.
+  // The event source carries its own day bounds as literals; the filter stack
+  // is what names the events themselves.
+  const source = plan.events
+    ? `${cubeEventsBetween(from, to)} AND site_id = ?${where}`
+    : `stats_cube
+         WHERE site_id = ? AND day BETWEEN ? AND ? AND name = 'pageview'${where}`;
+  const params = plan.events ? [siteId, ...binds] : [siteId, from, to, ...binds];
+
   const { results } = await db
     .prepare(
       `SELECT ${plan.column} AS name, SUM(${measure}) AS value, SUM(entrances) AS visits
-       FROM stats_cube
-       WHERE site_id = ? AND day BETWEEN ? AND ?
-         AND name ${plan.events ? "<> 'pageview'" : "= 'pageview'"}${where}
+       FROM ${source}
        GROUP BY ${plan.column}
        HAVING SUM(${measure}) > 0`,
     )
-    .bind(siteId, from, to, ...binds)
+    .bind(...params)
     .all<BreakdownRow>();
   return results;
 }

@@ -540,6 +540,23 @@ async function resolveSite(c: AppContext): Promise<SiteRow | Response> {
   return site ?? c.json({ error: 'no such site' }, 404);
 }
 
+/**
+ * The dashboard's filter stack, plus the `event` a panel was opened on.
+ *
+ * The stack narrows pageviews; a custom event is a different row, so it cannot
+ * ride along in `f` — the query layer would rightly drop a dimension it has no
+ * column for. Naming it by hand is treated exactly like a click on it in the
+ * Events panel: a filter on that event name, AND-ed with whatever else is set.
+ * The dashboard names events this way precisely because the tracker keeps them
+ * out of the pageview row's `f`.
+ */
+function resolveFilters(c: AppContext) {
+  const filters = parseFilters(c.req.query('f'));
+  const event = c.req.query('event');
+  if (event) filters.push({ dim: 'event', value: event });
+  return filters;
+}
+
 const NO_STORE = { 'cache-control': 'no-store' } as const;
 
 function summarize(components: Components): Record<Metric, number> {
@@ -637,14 +654,40 @@ app.get('/api/timeseries', async (c) => {
     return c.json({ error: 'unknown metric' }, 400);
   }
   const metric = requested as Metric;
-  const filters = parseFilters(c.req.query('f'));
+  // Carries `event` too, so a series can be drawn for one game rather than the
+  // whole site. The metric goes with it: an event has firings to count and no
+  // visitors, so the series counts its views whatever metric was asked for.
+  const filters = resolveFilters(c);
   const compare = c.req.query('cmp') === '1';
 
   await catchUpToday(c.env.DB, now);
 
-  const series = await loadSeries(c.env.DB, site.id, range, range.from, range.to, filters, now);
+  // An event fires; it has no visits of its own to count, so a series for one
+  // counts its firings whatever metric was asked for — the rule the Events
+  // panel counts by. Everything else is answered exactly as before.
+  const seriesMetric: Metric = filters.some((f) => f.dim === 'event') ? 'views' : metric;
+
+  const series = await loadSeries(
+    c.env.DB,
+    site.id,
+    range,
+    range.from,
+    range.to,
+    filters,
+    now,
+    seriesMetric,
+  );
   const previous = compare
-    ? await loadSeries(c.env.DB, site.id, range, range.prevFrom, range.prevTo, filters, now)
+    ? await loadSeries(
+        c.env.DB,
+        site.id,
+        range,
+        range.prevFrom,
+        range.prevTo,
+        filters,
+        now,
+        seriesMetric,
+      )
     : [];
 
   return c.json(
@@ -652,8 +695,8 @@ app.get('/api/timeseries', async (c) => {
       granularity: range.granularity,
       points: series.map((bucket, i) => ({
         label: bucket.label,
-        cur: metricValue(metric, bucket),
-        prev: previous[i] ? metricValue(metric, previous[i]!) : null,
+        cur: metricValue(seriesMetric, bucket),
+        prev: previous[i] ? metricValue(seriesMetric, previous[i]!) : null,
       })),
     },
     200,

@@ -78,8 +78,11 @@ const RESERVED_PATHS = new Set([
 ]);
 
 const DOMAIN_PATTERN = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/;
-const CORS_ALLOW_ORIGIN = 'https://game.leleleling.site';
-const CORS_ALLOW_METHODS = 'GET, POST, OPTIONS';
+const CORS_ALLOW_ORIGINS = new Set([
+  'https://game.leleleling.site',
+  'https://read.leleleling.site',
+]);
+const CORS_ALLOW_METHODS = 'GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS';
 const CORS_ALLOW_HEADERS = 'Content-Type, Authorization';
 const PUBLIC_API_PATHS = new Set(['/api/breakdown', '/api/summary', '/api/timeseries', '/api/realtime']);
 
@@ -99,14 +102,29 @@ type AppContext = Context<AppEnv>;
 
 const app = new Hono<AppEnv>();
 
-function addCorsHeaders(response: Response, request: Request): Response {
-  const headers = new Headers(response.headers);
+function applyCorsHeaders(headers: Headers, request: Request): void {
   const origin = request.headers.get('Origin');
 
-  headers.set('Access-Control-Allow-Origin', origin === CORS_ALLOW_ORIGIN ? origin : CORS_ALLOW_ORIGIN);
+  headers.delete('Access-Control-Allow-Origin');
+  headers.delete('Access-Control-Allow-Credentials');
+  if (origin && CORS_ALLOW_ORIGINS.has(origin)) {
+    headers.set('Access-Control-Allow-Origin', origin);
+    headers.set('Access-Control-Allow-Credentials', 'true');
+  }
+
   headers.set('Access-Control-Allow-Methods', CORS_ALLOW_METHODS);
   headers.set('Access-Control-Allow-Headers', CORS_ALLOW_HEADERS);
   headers.set('Access-Control-Max-Age', '86400');
+
+  const vary = headers.get('Vary');
+  if (!vary?.split(',').some((value) => value.trim().toLowerCase() === 'origin')) {
+    headers.append('Vary', 'Origin');
+  }
+}
+
+function addCorsHeaders(response: Response, request: Request): Response {
+  const headers = new Headers(response.headers);
+  applyCorsHeaders(headers, request);
 
   return new Response(response.body, {
     status: response.status,
@@ -224,10 +242,7 @@ app.use('*', async (c, next) => {
 
   if (request.method === 'OPTIONS') {
     const headers = new Headers();
-    headers.set('Access-Control-Allow-Origin', CORS_ALLOW_ORIGIN);
-    headers.set('Access-Control-Allow-Methods', CORS_ALLOW_METHODS);
-    headers.set('Access-Control-Allow-Headers', CORS_ALLOW_HEADERS);
-    headers.set('Access-Control-Max-Age', '86400');
+    applyCorsHeaders(headers, request);
     c.res = new Response(null, { status: 204, headers });
     return;
   }

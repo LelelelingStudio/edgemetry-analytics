@@ -21,6 +21,7 @@ import { loginPage, setupPage } from './pages';
 import {
   METRICS,
   type Components,
+  type Filter,
   type Metric,
   loadBreakdowns,
   loadRealtime,
@@ -85,7 +86,7 @@ const CORS_ALLOW_ORIGINS = new Set([
 ]);
 const CORS_ALLOW_METHODS = 'GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS';
 const CORS_ALLOW_HEADERS = 'Content-Type, Authorization';
-const PUBLIC_API_PATHS = new Set(['/api/breakdown', '/api/summary', '/api/timeseries', '/api/realtime']);
+const PUBLIC_API_PATHS = new Set(['/api/breakdown', '/api/summary', '/api/timeseries', '/api/realtime', '/api/public/stats']);
 
 /**
  * The `src` the console prints in its install snippet.
@@ -105,10 +106,14 @@ const app = new Hono<AppEnv>();
 
 function applyCorsHeaders(headers: Headers, request: Request): void {
   const origin = request.headers.get('Origin');
+  const isOpenApi = new URL(request.url).pathname.startsWith('/api/public/');
 
   headers.delete('Access-Control-Allow-Origin');
   headers.delete('Access-Control-Allow-Credentials');
-  if (origin && CORS_ALLOW_ORIGINS.has(origin)) {
+  if (isOpenApi) {
+    // Public read-only APIs: allow any origin, no credentials (must not set both).
+    headers.set('Access-Control-Allow-Origin', '*');
+  } else if (origin && CORS_ALLOW_ORIGINS.has(origin)) {
     headers.set('Access-Control-Allow-Origin', origin);
     headers.set('Access-Control-Allow-Credentials', 'true');
   }
@@ -750,6 +755,59 @@ app.get('/api/realtime', async (c) => {
   const site = await resolveSite(c);
   if (site instanceof Response) return site;
   return c.json(await loadRealtime(c.env.DB, site.id, new Date()), 200, NO_STORE);
+});
+
+// Public, read-only per-game stats for game developers.
+// GET /api/public/stats?game=<id>&range=30d&cmp=1
+//   -> { game, range, plays: {series,total,prevTotal}, favorites: {series,total,prevTotal} }
+// No login required (see PUBLIC_API_PATHS), CORS `*` (see applyCorsHeaders).
+app.get('/api/public/stats', async (c) => {
+  const site = await resolveSite(c);
+  if (site instanceof Response) return site;
+
+  const rawGame = (c.req.query('game') ?? '').trim();
+  if (!rawGame || !/^[A-Za-z0-9_\-\u4e00-\u9fa5. ]{1,80}$/.test(rawGame)) {
+    return c.json({ error: 'invalid game' }, 400);
+  }
+  const now = new Date();
+  const range = resolveRange(c.req.query('range'), c.req.query('from'), c.req.query('to'), now);
+  if (!range) return c.json({ error: 'invalid range' }, 400);
+  const compare = c.req.query('cmp') === '1';
+
+  await catchUpToday(c.env.DB, now);
+
+  const seriesFor = async (events: string[], prev = false) => {
+    const filters: Filter[] = events.map((name) => ({ dim: 'event', value: name }));
+    const buckets = await loadSeries(
+      c.env.DB,
+      site.id,
+      range,
+      prev ? range.prevFrom : range.from,
+      prev ? range.prevTo : range.to,
+      filters,
+      now,
+      'views',
+    );
+    return buckets.map((b) => ({ label: b.label, value: b.views }));
+  };
+
+  // Plays are keyed by game name, favorites by game id - accept either as `game`.
+  const plays = await seriesFor([`play-game_${rawGame}`]);
+  // Net favorites = fav minus unfav, subtracted bucket-by-bucket.
+  const favOnly = await seriesFor([`fav-game_${rawGame}`]);
+  const unfavOnly = await seriesFor([`unfav-game_${rawGame}`]);
+  const netFav = favOnly.map((b, i) => ({ label: b.label, value: b.value - (unfavOnly[i]?.value ?? 0) }));
+  const playPrev = compare ? await seriesFor([`play-game_${rawGame}`], true) : [];
+  const favPrev = compare ? await seriesFor([`fav-game_${rawGame}`], true) : [];
+  const unfavPrev = compare ? await seriesFor([`unfav-game_${rawGame}`], true) : [];
+
+  const total = (s: { value: number }[]) => s.reduce((sum, b) => sum + b.value, 0);
+  return c.json({
+    game: rawGame,
+    range: { id: c.req.query('range') ?? '30d', from: range.from, to: range.to, label: range.prevLabel },
+    plays: { series: plays, total: total(plays), prevTotal: compare ? total(playPrev) : null },
+    favorites: { series: netFav, total: total(netFav), prevTotal: compare ? total(favPrev) - total(unfavPrev) : null },
+  }, 200, NO_STORE);
 });
 
 app.get('/api/world.json', (c) =>

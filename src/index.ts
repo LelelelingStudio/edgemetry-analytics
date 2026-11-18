@@ -11,6 +11,7 @@ import {
 } from './auth';
 import dashboardTemplate from './dashboard.html';
 import gamecheckPage from '../gamecheck.html';
+import favgamesPage from '../favgames.html';
 import { ensureSchema, getSetting, setSetting } from './db';
 import { FONT_FACE_CSS, FONT_FILES } from './fonts';
 import { isBreakdownDim } from './dimensions';
@@ -788,6 +789,7 @@ app.get('/', async (c) => {
 });
 
 app.get('/gamecheck', (c) => c.html(gamecheckPage, 200));
+app.get('/favgames', (c) => c.html(favgamesPage, 200));
 
 app.get('/health', (c) => c.json({ ok: true }));
 

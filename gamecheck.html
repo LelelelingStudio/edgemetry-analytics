@@ -204,6 +204,26 @@
 <script>
     const BASE_API = '/api/breakdown?site=1&cmp=1&limit=1000&dim=path,referrer,event,country,device';
 
+    // 从主站读游戏目录：新埋点 play-game_<id> 与旧埋点 play-game_<名称/旧名>
+    // 都归一到数字 id 后合并；展示名一律用当前 json 里的名称。
+    let gameNameMap = null;
+    async function loadGameNames() {
+        if (gameNameMap) return gameNameMap;
+        gameNameMap = { byId: {}, byName: {} };
+        try {
+            const res = await fetch('https://game.leleleling.site/lelegame_data.json', { cache: 'no-store', mode: 'cors' });
+            const list = res.ok ? await res.json() : [];
+            list.forEach(g => {
+                const label = g.name_zh || g.name_en || g.name || String(g.id);
+                gameNameMap.byId[String(g.id)] = label;
+                const all = [g.name_zh, g.name_en, g.name]
+                    .concat(Array.isArray(g.previousNames) ? g.previousNames : []);
+                all.forEach(n => { if (n) gameNameMap.byName[String(n)] = String(g.id); });
+            });
+        } catch (e) {}
+        return gameNameMap;
+    }
+
     async function fetchData() {
         const range = document.getElementById('timeRange').value;
         const limitType = document.getElementById('topLimit').value;
@@ -222,14 +242,18 @@
             if (!response.ok) throw new Error('网络请求失败');
             
             const data = await response.json();
+            const names = await loadGameNames();
             const events = data.breakdowns?.event || [];
-            
-            let games = events
-                .filter(item => item.name.startsWith('play-game'))
-                .map(item => ({
-                    name: item.name.replace('play-game_', '').replace('play-game', '未知游戏'),
-                    count: item.value
-                }))
+
+            // 按 id 聚合新旧事件，展示用当前 json 名称（兼容历史名字事件）
+            const agg = new Map();
+            events.filter(item => String(item.name || '').startsWith('play-game')).forEach(item => {
+                const raw = String(item.name).replace('play-game_', '').replace('play-game', '');
+                const id = names.byId[raw] ? String(raw) : (names.byName[raw] || String(raw));
+                agg.set(id, (agg.get(id) || 0) + Number(item.value || 0));
+            });
+            let games = Array.from(agg.entries())
+                .map(([id, count]) => ({ name: names.byId[id] || id, count }))
                 .sort((a, b) => b.count - a.count);
 
             const totalViews = games.reduce((sum, item) => sum + item.count, 0);

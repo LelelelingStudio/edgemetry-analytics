@@ -230,20 +230,14 @@ const ADDED_COLUMNS: ReadonlyArray<string> = [
   'ALTER TABLE stats_daily ADD COLUMN duration INTEGER NOT NULL DEFAULT 0',
 ];
 
-/**
- * Applied once per isolate. This caches a global invariant (the schema exists),
- * not request state, so it is safe to hold at module scope. Every statement is
- * IF NOT EXISTS, so concurrent isolates racing here is harmless.
- */
-let schemaReady: Promise<void> | null = null;
+// Cache only completed initialization. An in-flight Promise belongs to the
+// request that created it and must not be shared with another Worker request.
+let schemaReady = false;
 
-export function ensureSchema(db: D1Database): Promise<void> {
-  schemaReady ??= applySchema(db).catch((err: unknown) => {
-    // Don't cache a failure — the next request should retry.
-    schemaReady = null;
-    throw err;
-  });
-  return schemaReady;
+export async function ensureSchema(db: D1Database): Promise<void> {
+  if (schemaReady) return;
+  await applySchema(db);
+  schemaReady = true;
 }
 
 async function applySchema(db: D1Database): Promise<void> {
